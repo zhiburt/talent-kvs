@@ -1,6 +1,9 @@
 extern crate clap;
 use clap::{App, Arg, SubCommand};
 
+extern crate kvs;
+use kvs::KvStore;
+
 fn main() {
     let matches = App::new("kvs")
         .subcommand(SubCommand::with_name("set").args(&[
@@ -26,9 +29,39 @@ fn main() {
     }
 
     match matches.subcommand() {
-        // ("set", Some(m)) => {},
-        // ("set", Some(m)) => {},
-        // ("set", Some(m)) => {},
+        ("set", Some(m)) => KvStore::open(std::path::Path::new(&std::env::current_dir().unwrap()))
+            .unwrap()
+            .set(
+                m.value_of("key").unwrap().to_owned(),
+                m.value_of("value").unwrap().to_owned(),
+            )
+            .unwrap(),
+        ("get", Some(m)) => {
+            let value = KvStore::open(std::path::Path::new(&std::env::current_dir().unwrap()))
+                .unwrap()
+                .get(m.value_of("key").unwrap().to_owned());
+
+            match value {
+                Ok(Some(val)) => println!("{}", val),
+                Ok(None) => println!("Key not found"),
+                Err(e) => println!("{}", e),
+            };
+        }
+
+        ("rm", Some(m)) => {
+            let value = KvStore::open(std::path::Path::new(&std::env::current_dir().unwrap()))
+                .unwrap()
+                .remove(m.value_of("key").unwrap().to_owned());
+
+            match value {
+                Err(e)=> 
+                {
+                    println!("Key not found");
+                    std::process::exit(1);
+                },
+                _ => (),
+            };
+        }
         _ => {
             eprintln!("unimplemented");
             std::process::exit(1);
