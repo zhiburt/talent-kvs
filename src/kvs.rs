@@ -1,10 +1,15 @@
 use std::collections::{HashMap, BTreeMap};
+use std::fs::File;
+use serde::{Deserialize, Serialize};
+use std::io::{
+    prelude::*,
+    BufReader,
+    BufWriter,
+    SeekFrom,
+    Seek,
+};
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
-
-use serde::{Deserialize, Serialize};
-use rmp_serde::{Deserializer, Serializer};
-use std::io::prelude::*;
 
 #[derive(Serialize, Deserialize)]
 enum Command {
@@ -12,7 +17,7 @@ enum Command {
     Set { key: String, val: String },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct CommandOp {
     start: u64,
     end: u64
@@ -39,8 +44,8 @@ impl<T:  std::ops::RangeBounds<u64>> From<T> for CommandOp {
 /// KvStore represent simple key value storage
 pub struct KvStore {
     store: HashMap<String, CommandOp>,
-    storage_w: std::io::BufWriter<std::fs::File>,
-    storage_r: std::io::BufReader<std::fs::File>,
+    storage_w: PositionBufWriter<File>,
+    storage_r: PositionBufReader<File>,
     path: std::path::PathBuf,
     untracked: u64,
 }
@@ -56,13 +61,11 @@ impl KvStore {
             .append(true)
             .open(&path)?;
         let f1 = std::fs::File::open(std::path::Path::new(&path))?;
-        let buffer = std::io::BufWriter::new(f);
-        let reader = std::io::BufReader::new(f1);
 
         let mut kv = KvStore {
             store: HashMap::new(),
-            storage_w: buffer,
-            storage_r: reader,
+            storage_w: PositionBufWriter::new(f)?,
+            storage_r: PositionBufReader::new(f1)?,
             path: path,
             untracked: 0,
         };
@@ -96,13 +99,11 @@ impl KvStore {
     /// it rewrite value if that alredy exists
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
         let c = Command::Set { key: key.clone(), val };
-        let position = self.storage_w.seek(std::io::SeekFrom::Current(0))?;
+        let position = self.storage_w.pos;
         let b = self.serialize(&c)?;
         self.write_to_file(&b)?;
-        let offset = self.storage_w.seek(std::io::SeekFrom::Current(0))?;
 
-        self.untracked += self.store.insert(key, CommandOp::from(position..offset)).map_or(0, |_| 1);
-        
+        self.untracked += self.store.insert(key, CommandOp::from(position.. self.storage_w.pos)).map_or(0, |_| 1);
         if self.untracked > 40 {
             self.compact()?;
         }
@@ -124,20 +125,17 @@ impl KvStore {
 
     fn init(&mut self) -> Result<()> {
         let mut start = 0u64;
-        while let Ok(command) =  rmp_serde::from_read(self.storage_r.get_ref()) {
-                let offset = self.storage_r.seek(std::io::SeekFrom::Current(0))? as u64;
+        while let Ok(command) =  rmp_serde::decode::from_read(&mut self.storage_r) {
                 let overwritten = match command {
-                    Command::Set { key, .. } => self.store.insert(key, CommandOp::from(start..offset)),
+                    Command::Set { key, .. } => self.store.insert(key, CommandOp::from(start..self.storage_r.pos)),
                     Command::Remove { key } => self.store.remove(&key),
                 };
                 self.untracked += overwritten.map_or(0, |_| 1);
 
-                start = offset;
+                start = self.storage_r.pos;
         }
 
-        self.storage_w.seek(std::io::SeekFrom::Start(
-            self.storage_r.seek(std::io::SeekFrom::Current(0))?
-        ))?;
+        self.storage_w.seek(std::io::SeekFrom::Start(self.storage_r.pos))?;
 
         Ok(())
     }
@@ -178,22 +176,91 @@ impl KvStore {
             }
         }
 
-        self.storage_w.get_mut().set_len(0)?;
+        self.storage_w.writer.get_mut().set_len(0)?;
         self.storage_w.seek(std::io::SeekFrom::Start(0))?;
         self.storage_r.seek(std::io::SeekFrom::Start(0))?;
         let mut start = 0u64;
         for (key, bin) in bin_commands {
             self.write_to_file(&bin)?;
-            let offset = self.storage_w.seek(std::io::SeekFrom::Current(0))?;
             let mut k = self.store.get_mut(key).unwrap();
             k.start = start;
-            k.end = offset;
-            start = offset;
+            k.end = self.storage_w.pos;
+            start = self.storage_w.pos;
         }
 
         self.untracked  = 0;
 
         Ok(())
+    }
+}
+
+struct PositionBufReader<R: Read + Seek> {
+    reader: BufReader<R>,
+    pos: u64,
+}
+
+impl<R: Read + Seek> PositionBufReader<R> {
+    fn new(mut reader: R) -> Result<Self> {
+        let current_pos = reader.seek(SeekFrom::Current(0))?;
+
+        Ok(PositionBufReader {
+            reader: BufReader::new(reader),
+            pos: current_pos,
+        })
+    }
+}
+
+impl<R: Read + Seek> Seek for PositionBufReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        self.pos = self.reader.seek(pos)?;
+        
+        Ok(self.pos)
+    }
+}
+
+impl<R: Read + Seek> Read for PositionBufReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let size = self.reader.read (buf)?;
+        self.pos += size as u64;
+
+        Ok(size)
+    }
+}
+
+struct PositionBufWriter<W: Write + Seek> {
+    writer: BufWriter<W>,
+    pos: u64,
+}
+
+impl<W: Write + Seek> PositionBufWriter<W> {
+    fn new(mut writer: W) -> Result<Self> {
+        let current_pos = writer.seek(SeekFrom::Current(0))?;
+
+        Ok(PositionBufWriter {
+            writer: BufWriter::new(writer),
+            pos: current_pos,
+        })
+    }
+}
+
+impl<W: Write + Seek> Seek for PositionBufWriter<W> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        self.pos = self.writer.seek(pos)?;
+        
+        Ok(self.pos)
+    }
+}
+
+impl<W: Write + Seek> Write for PositionBufWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        let size = self.writer.write(buf)?;
+        self.pos += size as u64;
+
+        Ok(size)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush()
     }
 }
 
