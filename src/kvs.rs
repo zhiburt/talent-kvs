@@ -1,6 +1,8 @@
 use std::collections::{HashMap, BTreeMap};
 use std::fs::File;
 use serde::{Deserialize, Serialize};
+use std::path::{PathBuf, Path};
+use std::ops::Range;
 use std::io::{
     prelude::*,
     BufReader,
@@ -8,6 +10,8 @@ use std::io::{
     SeekFrom,
     Seek,
 };
+
+static COMPACT_BOUND: u64 = 1001;
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -19,75 +23,81 @@ enum Command {
 
 #[derive(Clone, Debug)]
 struct CommandOp {
-    start: u64,
-    end: u64
+    pos: u64,
+    len: u64,
+    gen: Generation,
 }
 
-impl<T:  std::ops::RangeBounds<u64>> From<T> for CommandOp {
-    fn from(range: T) -> Self {
-        let start = match range.start_bound() {
-            std::ops::Bound::Included(val) => *val,
-            _ => 0
-        };
-        let end = match range.end_bound() {
-            std::ops::Bound::Excluded(val) => *val,
-            _ => 0
-        };
-
+impl From<(Generation, Range<u64>)> for CommandOp {
+    fn from((gen, range): (Generation, Range<u64>)) -> Self {
         CommandOp {
-            start: start,
-            end: end,
+            pos: range.start,
+            len: range.end - range.start,
+            gen,
         }
     }
 }
 
+type Generation = u64;
+
 /// KvStore represent simple key value storage
 pub struct KvStore {
-    store: HashMap<String, CommandOp>,
-    storage_w: PositionBufWriter<File>,
-    storage_r: PositionBufReader<File>,
+    index: HashMap<String, CommandOp>,
+    readers: BTreeMap<Generation, PositionBufReader<File>>,
+    writer: PositionBufWriter<File>,
     path: std::path::PathBuf,
     untracked: u64,
+    generation: Generation,
 }
 
 impl KvStore {
     /// Create new object of storage
-    pub fn open(folder: &std::path::Path) -> Result<Self> {
-        let path = folder.join("log.zs");
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        let f1 = std::fs::File::open(std::path::Path::new(&path))?;
+    pub fn open(folder: impl Into<PathBuf>) -> Result<Self> {
+        let path = folder.into();
+        let mut readers = BTreeMap::new();
 
-        let mut kv = KvStore {
-            store: HashMap::new(),
-            storage_w: PositionBufWriter::new(f)?,
-            storage_r: PositionBufReader::new(f1)?,
+        let generations = state(&path)?;
+        for &gen in  &generations {
+            readers.insert(gen, PositionBufReader::new(gen_file(gen, &path)?)?);
+        }
+
+        let current_generation = generations.last().map_or(0, |&g| g + 1);
+        let (writer, reader) = new_generation_file(current_generation, &path)?;
+
+        readers.insert(current_generation, PositionBufReader::new(reader)?);
+
+        let mut index = HashMap::new();
+        let mut untracked = 0;
+        for (&gen, reader) in &mut readers {
+            untracked += upload_index(&mut index, reader, gen)?
+        }
+
+        Ok(KvStore {
+            index: index,
+            writer: PositionBufWriter::new(writer)?,
+            readers: readers,
             path: path,
-            untracked: 0,
-        };
-
-        kv.init()?;
-
-        Ok(kv)
+            untracked: untracked,
+            generation: current_generation,
+        })
     }
 
     /// Get method tries to find value with `key`
     pub fn get(&mut self, k: String) -> Result<Option<String>> {
-        let index = self.store.get(&k);
-        
-        let command = match index {
+        let element = self.index.get(&k);
+        let command = match element {
             None => Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
             Some(op) => {
-                let mut buffer = Vec::with_capacity((op.end - op.start) as usize);
-                buffer.resize(buffer.capacity(), 0);
-                self.read_from(&mut buffer, std::io::SeekFrom::Start(op.start))?;
-                self.deserialize(&buffer)
+                let buffer = read_from_vec(self.readers.get_mut(&op.gen).expect("GG: cannot find"), op)?;
+                deserialize(&buffer)
             }
         };
+
+        eprintln!("inf {:?}", self.index);
+
+        for &r in self.readers.keys() {
+            eprintln!("-- inf {:?}\n", std::fs::read(log_path(r, &self.path))?);
+        }
 
         match command {
             Ok(Command::Set { val, ..}) => Ok(Some(val)),
@@ -98,13 +108,14 @@ impl KvStore {
     /// Set put new value in storage by key
     /// it rewrite value if that alredy exists
     pub fn set(&mut self, key: String, val: String) -> Result<()> {
-        let c = Command::Set { key: key.clone(), val };
-        let position = self.storage_w.pos;
-        let b = self.serialize(&c)?;
-        self.write_to_file(&b)?;
+        let command = Command::Set { key: key.clone(), val };
+        let b = serialize(&command)?;
+        let offset = write_to(&mut self.writer, &b)?;
 
-        self.untracked += self.store.insert(key, CommandOp::from(position.. self.storage_w.pos)).map_or(0, |_| 1);
-        if self.untracked > 40 {
+        let command = CommandOp::from((self.generation, offset.start..offset.end));
+        self.untracked += self.index.insert(key, command).map_or(0, |_| 1);
+
+        if self.untracked > COMPACT_BOUND {
             self.compact()?;
         }
 
@@ -113,86 +124,157 @@ impl KvStore {
 
     /// Delete key value pair from storage
     pub fn remove(&mut self, key: String) -> Result<()> {
-        if !self.store.contains_key(&key) {
+        if !self.index.contains_key(&key) {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         }
 
-        self.untracked += self.store.remove(&key).map_or(0, |_| 1);
-        self.write_to_file(
-            &self.serialize(&Command::Remove{key})?
-        )
+        eprintln!("inf {:?}", self.index);
+
+        self.untracked += self.index.remove(&key).map_or(0, |_| 1);
+        self.write(&serialize(&Command::Remove{key})?)
     }
 
-    fn init(&mut self) -> Result<()> {
-        let mut start = 0u64;
-        while let Ok(command) =  rmp_serde::decode::from_read(&mut self.storage_r) {
-                let overwritten = match command {
-                    Command::Set { key, .. } => self.store.insert(key, CommandOp::from(start..self.storage_r.pos)),
-                    Command::Remove { key } => self.store.remove(&key),
-                };
-                self.untracked += overwritten.map_or(0, |_| 1);
+    fn compact(&mut self) -> Result<()> {
+        let compact_gen = self.generation  + 1;
+        let (cgw, cgr) = new_generation_file(compact_gen, &self.path)?;
+        compact_to(&mut self.index, &mut self.readers, &mut PositionBufWriter::new(cgw)?, compact_gen)?;
 
-                start = self.storage_r.pos;
+        for (&gen, _) in &self.readers {
+            std::fs::remove_file(log_path(gen, &self.path))?;
         }
 
-        self.storage_w.seek(std::io::SeekFrom::Start(self.storage_r.pos))?;
+        self.readers.clear();
+        self.readers.insert(compact_gen, PositionBufReader::new(cgr)?);
+
+        let current_gen = compact_gen + 1;
+        let (cw, cr) =  new_generation_file(current_gen, &self.path)?;
+        self.readers.insert(current_gen, PositionBufReader::new(cr)?);
+        self.writer = PositionBufWriter::new(cw)?;
+
+        self.untracked = 0;
+        self.generation = current_gen;
 
         Ok(())
     }
 
-    fn write_to_file(&mut self, b: &[u8]) -> Result<()> {
-        self.storage_w.write(&b)?;
-        self.storage_w.flush()
-    }
-
-    fn read_from(&mut self, buf: &mut [u8], offset: std::io::SeekFrom) -> Result<()> {
-        self.storage_r.seek(offset)?;
-        self.storage_r.read(buf)?;
+    fn write(&mut self, b: &[u8]) -> Result<()> {
+        write_to(&mut self.writer, b)?;
         Ok(())
     }
+}
 
-    fn deserialize(&self, bytes: &[u8]) -> Result<Command> {
+    fn write_to(mut writer: &mut PositionBufWriter<File>, b: &[u8]) -> Result<Range<u64>> {
+        let start_position = writer.pos;
+        writer.write(&b)?;
+        writer.flush()?;
+
+        Ok(start_position..writer.pos)
+    }
+
+    fn deserialize(bytes: &[u8]) -> Result<Command> {
         rmp_serde::decode::from_slice(&bytes).
             map_err(|_| { std::io::Error::from(std::io::ErrorKind::Interrupted) })
     }
 
-    fn serialize(&self, c: &Command) -> Result<(Vec<u8>)> {
+    fn serialize(c: &Command) -> Result<(Vec<u8>)> {
         rmp_serde::encode::to_vec(&c).
             map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
     }
 
-    fn compact(&mut self) -> Result<()> {
-        let mut bin_commands = Vec::new();
-        let store = self.store.iter().map(|op| (op.0.clone(), op.1.clone())).collect::<Vec<(String, CommandOp)>>();
-
-        for (key, offset) in store.iter() {
-            let mut buffer = Vec::with_capacity((offset.end - offset.start) as usize);
-            buffer.resize(buffer.capacity(), 0);
-            self.read_from(&mut buffer, std::io::SeekFrom::Start(offset.start))?;
-
-            match self.deserialize(&buffer)? {
-                Command::Set{..} => {  bin_commands.push((key, buffer)); },
-                _ => ()
-            }
+    fn compact_to(
+        index: &mut HashMap<String, CommandOp>,
+        readers: &mut BTreeMap<Generation, PositionBufReader<File>>,
+        writer: &mut PositionBufWriter<File>,
+        gen: Generation) -> Result<()>
+    {
+        for pos in index.values_mut() {
+            println!("{:?} {:?}", readers.keys(), pos);
+            let reader = readers.get_mut(&pos.gen).expect("GG: cannot find");
+            let content = read_from_vec(reader, pos)?;
+            let offset = write_to(writer,&content)?;
+            *pos = CommandOp::from((gen, offset.start..offset.end));
         }
-
-        self.storage_w.writer.get_mut().set_len(0)?;
-        self.storage_w.seek(std::io::SeekFrom::Start(0))?;
-        self.storage_r.seek(std::io::SeekFrom::Start(0))?;
-        let mut start = 0u64;
-        for (key, bin) in bin_commands {
-            self.write_to_file(&bin)?;
-            let mut k = self.store.get_mut(key).unwrap();
-            k.start = start;
-            k.end = self.storage_w.pos;
-            start = self.storage_w.pos;
-        }
-
-        self.untracked  = 0;
 
         Ok(())
     }
-}
+
+    fn read_from_vec(reader: &mut PositionBufReader<File>, pos: &CommandOp) -> Result<Vec<u8>> {
+        let mut buffer = Vec::with_capacity(pos.len as usize);
+        buffer.resize(buffer.capacity(), 0);
+        read_from(reader, &mut buffer, pos)?;
+
+        Ok(buffer)
+    }
+
+    fn read_from(reader: &mut PositionBufReader<File>, buf: &mut [u8], pos: &CommandOp) -> Result<()> {
+        reader.seek(SeekFrom::Start(pos.pos))?;
+        let mut content = reader.take(pos.len);
+        content.read(buf)?;
+
+        Ok(())
+    }
+
+    fn upload_index(index: &mut HashMap<String, CommandOp>, mut reader: &mut PositionBufReader<File>, gen: Generation) -> Result<u64> {
+        let mut start = 0u64;
+        let mut untracked = 0;
+        while let Ok(command) =  rmp_serde::decode::from_read(&mut reader) {
+                let overwritten = match command {
+                    Command::Set { key, .. } => index.insert(key, CommandOp::from((gen, start..reader.pos))),
+                    Command::Remove { key } => index.remove(&key),
+                };
+                untracked += overwritten.map_or(0, |_| 1);
+
+                start = reader.pos;
+        }
+
+        Ok(untracked)
+    }
+
+    fn state(path: &PathBuf) -> Result<Vec<Generation>> {
+        let mut generations: Vec<u64> = std::fs::read_dir(path)?.
+            flat_map(|entry| -> Result<_> { Ok(entry?.path()) }).
+            filter(|path| path.is_file() && path.extension() == Some("sil".as_ref())).
+            flat_map(|fname| {
+                fname.file_stem().
+                    and_then(std::ffi::OsStr::to_str).
+                    map(str::parse::<Generation>)
+            }).
+            flatten().
+            collect();
+
+        generations.sort_unstable();
+
+        Ok(generations)
+    }
+
+    fn gen_file(gen: Generation, path: &PathBuf) -> Result<File> {
+        gen_file_ops(gen, path, None)
+    }
+
+    fn new_generation_file(gen: Generation, path: &PathBuf) -> Result<(File, File)> {
+        let mut ops = std::fs::OpenOptions::new();
+        ops.read(true).
+            write(true).
+            create(true).
+            append(true);
+
+        let writer = gen_file_ops(gen, path, Some(ops))?;
+        let reader = gen_file_ops(gen, path, None)?;
+
+        Ok((writer, reader))
+    }
+
+    fn gen_file_ops(gen: Generation, path: &PathBuf, options: Option<std::fs::OpenOptions>) -> Result<File> {
+        let p = log_path(gen, path);
+        match options {
+            Some(ops) => ops.open(p),
+            None => File::open(p),
+        }
+    }
+
+    fn log_path(gen: u64, dir: &Path) -> PathBuf {
+        dir.join(format!("{}.sil", gen))
+    }
 
 struct PositionBufReader<R: Read + Seek> {
     reader: BufReader<R>,
@@ -213,7 +295,7 @@ impl<R: Read + Seek> PositionBufReader<R> {
 impl<R: Read + Seek> Seek for PositionBufReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         self.pos = self.reader.seek(pos)?;
-        
+
         Ok(self.pos)
     }
 }
@@ -246,7 +328,7 @@ impl<W: Write + Seek> PositionBufWriter<W> {
 impl<W: Write + Seek> Seek for PositionBufWriter<W> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         self.pos = self.writer.seek(pos)?;
-        
+
         Ok(self.pos)
     }
 }
@@ -261,11 +343,5 @@ impl<W: Write + Seek> Write for PositionBufWriter<W> {
 
     fn flush(&mut self) -> Result<()> {
         self.writer.flush()
-    }
-}
-
-impl Drop for KvStore  { 
-    fn drop(&mut self){
-        self.storage_w.flush();
     }
 }
