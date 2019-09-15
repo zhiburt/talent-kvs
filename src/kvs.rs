@@ -5,10 +5,9 @@ use std::fs::File;
 use std::io::{prelude::*, BufReader, BufWriter, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use crate::{KvsError, Result};
 
 static COMPACT_BOUND: u64 = 1001;
-
-pub type Result<T> = std::result::Result<T, std::io::Error>;
 
 type Generation = u64;
 
@@ -56,18 +55,15 @@ impl KvStore {
 
     /// Get method tries to find value with `key`
     pub fn get(&mut self, k: String) -> Result<Option<String>> {
-        let element = self.index.get(&k);
-        let command = match element {
-            None => Err(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+        match self.index.get(&k) {
+            None => Ok(None),
             Some(op) => {
                 let b = read_to_vec(self.readers.get_mut(&op.gen).expect("GG: cannot find"), op)?;
-                deserialize(&b)
+                match deserialize(&b) {
+                    Ok(Command::Set { val, .. }) => Ok(Some(val)),
+                    _ => Err(KvsError::AppropriateCommandNotFound),
+                }
             }
-        };
-
-        match command {
-            Ok(Command::Set { val, .. }) => Ok(Some(val)),
-            _ => Ok(None),
         }
     }
 
@@ -94,7 +90,7 @@ impl KvStore {
     /// Delete key value pair from storage
     pub fn remove(&mut self, key: String) -> Result<()> {
         if !self.index.contains_key(&key) {
-            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            return Err(KvsError::KeyNotFound);
         }
 
         self.untracked += self.index.remove(&key).map_or(0, |old| old.len);
@@ -134,13 +130,11 @@ impl KvStore {
 }
 
 fn deserialize(bytes: &[u8]) -> Result<Command> {
-    rmp_serde::decode::from_slice(&bytes)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::Interrupted))
+    Ok(rmp_serde::decode::from_slice(&bytes)?)
 }
 
 fn serialize(c: &Command) -> Result<(Vec<u8>)> {
-    rmp_serde::encode::to_vec(&c)
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    Ok(rmp_serde::encode::to_vec(&c)?)
 }
 
 fn compact_to(
@@ -225,7 +219,7 @@ fn state(path: &PathBuf) -> Result<Vec<Generation>> {
     Ok(generations)
 }
 
-fn gen_file(gen: Generation, path: &PathBuf) -> Result<File> {
+fn gen_file(gen: Generation, path: &PathBuf) -> std::io::Result<File> {
     gen_file_ops(gen, path, None)
 }
 
@@ -243,7 +237,7 @@ fn gen_file_ops(
     gen: Generation,
     path: &PathBuf,
     options: Option<std::fs::OpenOptions>,
-) -> Result<File> {
+) -> std::io::Result<File> {
     let p = gen_path(gen, path);
     match options {
         Some(ops) => ops.open(p),
@@ -307,7 +301,7 @@ impl<R: Read + Seek> PositionBufReader<R> {
 }
 
 impl<R: Read + Seek> Seek for PositionBufReader<R> {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         self.pos = self.reader.seek(pos)?;
 
         Ok(self.pos)
@@ -315,7 +309,7 @@ impl<R: Read + Seek> Seek for PositionBufReader<R> {
 }
 
 impl<R: Read + Seek> Read for PositionBufReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let size = self.reader.read(buf)?;
         self.pos += size as u64;
 
@@ -340,7 +334,7 @@ impl<W: Write + Seek> PositionBufWriter<W> {
 }
 
 impl<W: Write + Seek> Seek for PositionBufWriter<W> {
-    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         self.pos = self.writer.seek(pos)?;
 
         Ok(self.pos)
@@ -348,14 +342,14 @@ impl<W: Write + Seek> Seek for PositionBufWriter<W> {
 }
 
 impl<W: Write + Seek> Write for PositionBufWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let size = self.writer.write(buf)?;
         self.pos += size as u64;
 
         Ok(size)
     }
 
-    fn flush(&mut self) -> Result<()> {
+    fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
     }
 }

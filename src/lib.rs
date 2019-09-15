@@ -1,3 +1,5 @@
 mod kvs;
+mod error;
 
-pub use crate::kvs::{KvStore, Result};
+pub use crate::kvs::{KvStore};
+pub use error::{KvsError, Result};
