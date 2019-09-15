@@ -82,7 +82,7 @@ impl KvStore {
         let offset = write_to(&mut self.writer, &b)?;
 
         let command = CommandPos::from((self.generation, offset.start..offset.end));
-        self.untracked += self.index.insert(key, command).map_or(0, |_| 1);
+        self.untracked += self.index.insert(key, command).map_or(0, |old| old.len);
 
         if self.untracked > COMPACT_BOUND {
             self.compact()?;
@@ -97,7 +97,7 @@ impl KvStore {
             return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
         }
 
-        self.untracked += self.index.remove(&key).map_or(0, |_| 1);
+        self.untracked += self.index.remove(&key).map_or(0, |old| old.len);
         self.write(&serialize(&Command::Remove { key })?)
     }
 
@@ -190,14 +190,17 @@ fn upload_index(
     let mut start = 0u64;
     let mut untracked = 0;
     while let Ok(command) = rmp_serde::decode::from_read(&mut reader) {
-        let overwritten = match command {
-            Command::Set { key, .. } => {
-                index.insert(key, CommandPos::from((gen, start..reader.pos)))
+        let cleaned_bytes = match command {
+            Command::Set { key, .. } => index
+                .insert(key, CommandPos::from((gen, start..reader.pos)))
+                .map_or(0, |old| old.len),
+            Command::Remove { key } => {
+                let old_bytes = index.remove(&key).map_or(0, |old| old.len);
+                let this_command_bytes = reader.pos - start;
+                old_bytes + this_command_bytes
             }
-            Command::Remove { key } => index.remove(&key),
         };
-        untracked += overwritten.map_or(0, |_| 1);
-
+        untracked += cleaned_bytes;
         start = reader.pos;
     }
 
