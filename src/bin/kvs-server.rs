@@ -1,13 +1,17 @@
 use structopt::StructOpt;
-use log::{info, warn};
+use log::{info, warn, error};
 use std::net::{TcpListener, TcpStream};
 use std::io::{
     Result,
     prelude::*,
 };
-use kvs::KvStore;
-mod protocol;
-use protocol::{Package, construct_package, deconstruct_package};
+use kvs::{
+    KvStore,
+    Package, 
+    ok_package,
+    construct_package,
+    deconstruct_package
+};
 
 #[derive(Debug, StructOpt)]
 struct Opt {
@@ -18,10 +22,10 @@ struct Opt {
 }
 
 fn main() -> Result<()> {
-    stderrlog::new().verbosity(10).quiet(false).init().unwrap();
+    stderrlog::new().module(module_path!()).init().unwrap();
     let opt = Opt::from_args();
 
-    info!("{} version={}, config={:?}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION_PRE"), opt);
+    error!("{} version={}, address={}, engine={}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), opt.address, opt.engine);
 
     let mut kvs = KvStore::open(".").expect("cannot open kvs store");
     
@@ -48,7 +52,7 @@ fn handle (mut socket: TcpStream, kvs: &mut kvs::KvStore) -> std::io::Result<()>
     match pkg {
         Package::Remove(key) => {
             if kvs.remove(std::str::from_utf8(key).unwrap().to_owned()).is_ok() {
-                socket.write(&construct_package(Package::OK(&[])))?;
+                socket.write(&construct_package(ok_package()))?;
                 info!("send blank OK");
             } else {
                     socket.write(&construct_package(Package::Error("cannot be found key".as_bytes())))?;
@@ -63,8 +67,7 @@ fn handle (mut socket: TcpStream, kvs: &mut kvs::KvStore) -> std::io::Result<()>
                     info!("send OK {}", val);
                 },
                 Ok(None) => {
-                    socket.write(&construct_package(Package::OK(&[])))?;
-                    // should be provided blank OK package by default, it it will be replaced and above sample too
+                    socket.write(&construct_package(ok_package()))?;
                     info!("send ok with none");
                 },
                 Err(msg) => {
@@ -75,7 +78,7 @@ fn handle (mut socket: TcpStream, kvs: &mut kvs::KvStore) -> std::io::Result<()>
         },
         Package::Set(key, val) => {
             if kvs.set(std::str::from_utf8(key).unwrap().to_owned(), std::str::from_utf8(val).unwrap().to_owned()).is_ok() {
-                socket.write(&construct_package(Package::OK(&[])))?;
+                socket.write(&construct_package(ok_package()))?;
                 info!("send blank OK");
             } else {
                     socket.write(&construct_package(Package::Error("something went wrong".as_bytes())))?;

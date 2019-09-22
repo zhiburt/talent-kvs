@@ -1,9 +1,12 @@
 use structopt::StructOpt;
-use kvs::KvStore;
+use kvs::{
+    Package, 
+    ok_package,
+    construct_package,
+    deconstruct_package
+};
 use std::io::prelude::*;
 use std::net::TcpStream;
-use protocol::{Package, construct_package, deconstruct_package};
-mod protocol;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
