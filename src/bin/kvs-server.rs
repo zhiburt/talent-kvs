@@ -7,6 +7,7 @@ use std::io::{
 };
 use kvs::{
     KvStore,
+    KvsEngine,
     Package, 
     ok_package,
     construct_package,

@@ -6,6 +6,7 @@ use std::io::{prelude::*, BufReader, BufWriter, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use crate::{KvsError, Result};
+use super::KvsEngine;
 
 static COMPACT_BOUND: u64 = 1001;
 
@@ -22,7 +23,7 @@ pub struct KvStore {
 }
 
 impl KvStore {
-    /// Create new object of storage
+     /// Create new object of storage
     pub fn open(folder: impl Into<PathBuf>) -> Result<Self> {
         let path = folder.into();
         let mut readers = BTreeMap::new();
@@ -51,50 +52,6 @@ impl KvStore {
             untracked: untracked,
             generation: current_generation,
         })
-    }
-
-    /// Get method tries to find value with `key`
-    pub fn get(&mut self, k: String) -> Result<Option<String>> {
-        match self.index.get(&k) {
-            None => Ok(None),
-            Some(op) => {
-                let b = read_to_vec(self.readers.get_mut(&op.gen).expect("GG: cannot find"), op)?;
-                match deserialize(&b) {
-                    Ok(Command::Set { val, .. }) => Ok(Some(val)),
-                    _ => Err(KvsError::AppropriateCommandNotFound),
-                }
-            }
-        }
-    }
-
-    /// Set put new value in storage by key
-    /// it rewrite value if that alredy exists
-    pub fn set(&mut self, key: String, val: String) -> Result<()> {
-        let command = Command::Set {
-            key: key.clone(),
-            val,
-        };
-        let b = serialize(&command)?;
-        let offset = write_to(&mut self.writer, &b)?;
-
-        let command = CommandPos::from((self.generation, offset.start..offset.end));
-        self.untracked += self.index.insert(key, command).map_or(0, |old| old.len);
-
-        if self.untracked > COMPACT_BOUND {
-            self.compact()?;
-        }
-
-        Ok(())
-    }
-
-    /// Delete key value pair from storage
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        if !self.index.contains_key(&key) {
-            return Err(KvsError::KeyNotFound);
-        }
-
-        self.untracked += self.index.remove(&key).map_or(0, |old| old.len);
-        self.write(&serialize(&Command::Remove { key })?)
     }
 
     fn compact(&mut self) -> Result<()> {
@@ -126,6 +83,52 @@ impl KvStore {
     fn write(&mut self, b: &[u8]) -> Result<()> {
         write_to(&mut self.writer, b)?;
         Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
+    /// Get method tries to find value with `key`
+    fn get(&mut self, k: String) -> Result<Option<String>> {
+        match self.index.get(&k) {
+            None => Ok(None),
+            Some(op) => {
+                let b = read_to_vec(self.readers.get_mut(&op.gen).expect("GG: cannot find"), op)?;
+                match deserialize(&b) {
+                    Ok(Command::Set { val, .. }) => Ok(Some(val)),
+                    _ => Err(KvsError::AppropriateCommandNotFound),
+                }
+            }
+        }
+    }
+
+    /// Set put new value in storage by key
+    /// it rewrite value if that alredy exists
+    fn set(&mut self, key: String, val: String) -> Result<()> {
+        let command = Command::Set {
+            key: key.clone(),
+            val,
+        };
+        let b = serialize(&command)?;
+        let offset = write_to(&mut self.writer, &b)?;
+
+        let command = CommandPos::from((self.generation, offset.start..offset.end));
+        self.untracked += self.index.insert(key, command).map_or(0, |old| old.len);
+
+        if self.untracked > COMPACT_BOUND {
+            self.compact()?;
+        }
+
+        Ok(())
+    }
+
+    /// Delete key value pair from storage
+    fn remove(&mut self, key: String) -> Result<()> {
+        if !self.index.contains_key(&key) {
+            return Err(KvsError::KeyNotFound);
+        }
+
+        self.untracked += self.index.remove(&key).map_or(0, |old| old.len);
+        self.write(&serialize(&Command::Remove { key })?)
     }
 }
 

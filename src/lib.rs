@@ -1,10 +1,8 @@
-mod kvs;
-mod kvsengine;
+mod engines;
 mod error;
 mod protocol;
 
-pub use crate::kvs::{KvStore};
-pub use crate::kvsengine::KvsEngine;
+pub use engines::{KvStore, KvsEngine};
 pub use error::{KvsError, Result};
 pub use protocol::{
     Package,
