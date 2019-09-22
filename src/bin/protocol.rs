@@ -2,7 +2,7 @@ use std::io::Result;
 use std::net::TcpStream;
 
 pub enum Package<'a> {
-    OK,
+    OK(&'a [u8]),
     Error(&'a [u8]),
     Get(&'a [u8]),
     Set(&'a [u8], &'a [u8]),
@@ -12,9 +12,11 @@ pub enum Package<'a> {
 impl<'a> std::fmt::Display for Package<'a>{
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
+            Package::OK(body) => writeln!(f, "package<OK> {}", std::str::from_utf8(body).unwrap()),
+            Package::Error(msg) => writeln!(f, "package<error> {}", std::str::from_utf8(msg).unwrap()),
+            Package::Remove(key) => writeln!(f, "package<remove> {}", std::str::from_utf8(key).unwrap()),
             Package::Get(key) => writeln!(f, "package<get> {}", std::str::from_utf8(key).unwrap()),
             Package::Set(key, val) => writeln!(f, "package<set> {} {}", std::str::from_utf8(key).unwrap(), std::str::from_utf8(val).unwrap()),
-            _ => unimplemented!(),
         }
     }
 }
@@ -51,20 +53,23 @@ pub fn construct_package(p: Package) -> Vec<u8> {
         Package::Error(mss) => fill_single_buffer(&mut buffer, PackageType::Error, bsize, mss),
         Package::Get(key) => fill_single_buffer(&mut buffer, PackageType::Get, bsize, key),
         Package::Remove(key) => fill_single_buffer(&mut buffer, PackageType::Remove, bsize, key),
-        Package::OK => fill_single_buffer(&mut buffer, PackageType::OK, 0, &[0]),
+        Package::OK(body) => fill_single_buffer(&mut buffer, PackageType::OK, bsize, body),
         Package::Set(key, val) => fill_double_buffer(&mut buffer, PackageType::Set, bsize, key, val),
     };
 
     buffer
 }
 
+// check the old version
 pub fn deconstruct_package(b: &[u8]) -> Package {
     let default_part = prelude_size as usize;
     let b_size =  u32::from_be_bytes([b[2], b[3], b[4], b[5]]) as usize;
     let finish_body = default_part + b_size;
-    println!("size {}s", b.len());
     match b[0].into() {
-        PackageType::Get => Package::Get(&b[default_part..]),
+        PackageType::OK => Package::OK(&b[default_part..finish_body]),
+        PackageType::Error => Package::Error(&b[default_part..finish_body]),
+        PackageType::Remove => Package::Remove(&b[default_part..finish_body]),
+        PackageType::Get => Package::Get(&b[default_part..finish_body]),
         PackageType::Set => Package::Set(&b[default_part..finish_body], &b[finish_body ..]),
         _ => unimplemented!(),
     }
@@ -82,7 +87,7 @@ fn body_size(p: &Package) -> u32 {
         Package::Get(key) => key.len(),
         Package::Remove(key) => key.len(),
         Package::Set(key, val) => key.len() + val.len(),
-        Package::OK => 0,
+        Package::OK(b) => b.len(),
     }) as u32
 }
 

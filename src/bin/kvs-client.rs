@@ -33,24 +33,44 @@ enum Command {
 fn main() -> std::io::Result<()> {
     let opt = Opt::from_args();
 
-    let mut storage = kvs::KvStore::open(".").expect("cannot open kvs storage") ;
+    let mut socket = TcpStream::connect(opt.address.clone())?;
+    let mut buffer = [0; 1024];
     match opt.command {
     Command::Get {key} => {
-            match storage.get(key) {
-                Ok(Some(val)) => println!("{}", val),
-                Ok(None) => println!("Key not found"),
-                Err(e) => println!("{}", e),
+        socket.write(&construct_package(Package::Get(key.as_bytes())))?;
+        socket.read(&mut buffer)?;
+        match deconstruct_package(&buffer) {
+            Package::OK(val) => {
+                if val.len() > 0 {
+                    println!("{}", std::str::from_utf8(val).unwrap())
+                } else {
+                    println!("Key not found")
+                }
+            },
+            Package::Error(e) => println!("{}", std::str::from_utf8(e).unwrap()),
+            _ => unreachable!(),
+        };
+    },
+    Command::Set {key, val} => {
+            socket.write(&construct_package(Package::Set(key.as_bytes(), val.as_bytes())))?;
+            socket.read(&mut buffer)?;
+            match deconstruct_package(&buffer) {
+                Package::OK(val) => (),
+                Package::Error(e) => println!("{}", std::str::from_utf8(e).unwrap()),
+                _ => unreachable!(),
             };
     },
-    Command::Set {key, val} => storage.set(key, val).expect("unexpected error in setting process"),
-    Command::Remove {key} => storage.remove(key).expect("Key not found"),
-    }
-
-    let mut socket = TcpStream::connect(opt.address.clone())?;
-    socket.write(&construct_package(Package::Get("maxim, that is me, gonna be asleep".as_bytes())))?;
-    drop(socket);
-    let mut socket = TcpStream::connect(opt.address)?;
-    socket.write(&construct_package(Package::Set("have a greate night, bye".as_bytes(), "!".as_bytes())))?;
+    Command::Remove {key} => {
+        socket.write(&construct_package(Package::Remove(key.as_bytes())))?;
+        socket.read(&mut buffer)?;
+        match deconstruct_package(&buffer) {
+            Package::OK(val) => (),
+            Package::Error(e) => println!("{}", std::str::from_utf8(e).unwrap()),
+            _ => unreachable!(),
+        };
+    },
+    _ => unreachable!(),
+    };
 
     Ok(())
 }
