@@ -10,3 +10,4 @@ mod kvs;
 mod sled;
 
 pub use kvs::KvStore;
+pub use self::sled::SledStorage;

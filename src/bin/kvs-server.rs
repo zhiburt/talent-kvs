@@ -8,6 +8,7 @@ use std::io::{
 use kvs::{
     KvStore,
     KvsEngine,
+    SledStorage,
     Package, 
     ok_package,
     construct_package,
@@ -28,15 +29,52 @@ fn main() -> Result<()> {
 
     error!("{} version={}, address={}, engine={}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), opt.address, opt.engine);
 
-    let mut kvs = KvStore::open(".").expect("cannot open kvs store");
-    
-    let listener = TcpListener::bind(opt.address)?;
+    if let Some(old_engine) = current_engine(std::env::current_dir()?){
+        if old_engine != opt.engine {
+            eprintln!("the storage was configured already using another engine");
+            std::process::exit(1);
+        }
+    } else {
+        pin_engine(std::env::current_dir()?, opt.engine.clone())?;
+    }
+
+    let addr = opt.address.parse::<std::net::SocketAddr>().expect("cannot parse socket address");
+    if opt.engine == "kvs" {
+        run(KvStore::open(std::env::current_dir()?).expect("cannot open kvs store"), addr)?;
+    } else if opt.engine == "sled" {
+        run(SledStorage::open(std::env::current_dir()?).expect("cannot open sled storage"), addr)?;
+    } else {
+        error!("wrong engine");
+        std::process::exit(1);
+    };
+
+    Ok(())
+}
+
+fn pin_engine(path: std::path::PathBuf, engine_name: String) -> Result<()> {
+    let mut f = std::fs::File::create(path.join("engine"))?;
+    f.write(engine_name.as_ref())?;
+    f.flush()
+}
+
+fn current_engine(path: std::path::PathBuf) -> Option<String> {
+    let p = path.join("engine");
+    let engine_name = std::fs::read(p);
+    if engine_name.is_err() {
+        return None;
+    }
+
+    Some(String::from_utf8(engine_name.unwrap()).unwrap())
+}
+
+fn run<E: KvsEngine>(mut engine: E, addr: std::net::SocketAddr) -> Result<()> {
+    let listener = TcpListener::bind(addr)?;
     for stream in listener.incoming() {
         let mut conn = stream?;
         info!("got connection to socket {}",  conn.peer_addr()?);
         
-        handle(conn, &mut kvs)?;
-    }
+        handle(conn, &mut engine)?;
+    };
 
     Ok(())
 }
@@ -44,7 +82,7 @@ fn main() -> Result<()> {
 // read package
 // send ok
 // send responce
-fn handle (mut socket: TcpStream, kvs: &mut kvs::KvStore) -> std::io::Result<()> {
+fn handle<E: KvsEngine>(mut socket: TcpStream, kvs: &mut E) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     socket.read(&mut buffer)?;
     let pkg = deconstruct_package(&buffer);
@@ -56,7 +94,7 @@ fn handle (mut socket: TcpStream, kvs: &mut kvs::KvStore) -> std::io::Result<()>
                 socket.write(&construct_package(ok_package()))?;
                 info!("send blank OK");
             } else {
-                    socket.write(&construct_package(Package::Error("cannot be found key".as_bytes())))?;
+                    socket.write(&construct_package(Package::Error("Key not found".as_bytes())))?;
                     warn!("send error");
                 };
             },
@@ -64,7 +102,7 @@ fn handle (mut socket: TcpStream, kvs: &mut kvs::KvStore) -> std::io::Result<()>
             match kvs.get(std::str::from_utf8(key).unwrap().to_owned()) {
                 Ok(Some(val)) => {
                     // what is happening with size of the value?
-                    socket.write(&construct_package(Package::OK(val.as_ref())))?;
+                    socket.write(&construct_package(Package::OK(val.trim_matches(char::from(0)).as_ref())))?;
                     info!("send OK {}", val);
                 },
                 Ok(None) => {

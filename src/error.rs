@@ -9,6 +9,10 @@ pub enum KvsError {
     SerdeDecode(#[cause] rmp_serde::decode::Error),
     #[fail(display = "{}", _0)]
     SerdeEncode(#[cause] rmp_serde::encode::Error),
+    #[fail(display = "{}", _0)]
+    Sled(#[cause] sled::Error),
+    #[fail(display = "UTF-8 error: {}", _0)]
+    Utf8(#[cause] std::string::FromUtf8Error),
     #[fail(display = "Key not found")]
     KeyNotFound, 
     #[fail(display = "Cannot find a command we involved in")]
@@ -30,6 +34,18 @@ impl From<rmp_serde::decode::Error> for KvsError {
 impl From<rmp_serde::encode::Error> for KvsError {
     fn from(err: rmp_serde::encode::Error) -> KvsError {
         KvsError::SerdeEncode(err)
+    }
+}
+
+impl From<sled::Error> for KvsError {
+    fn from(err: sled::Error) -> KvsError {
+        KvsError::Sled(err)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for KvsError {
+    fn from(err: std::string::FromUtf8Error) -> KvsError {
+        KvsError::Utf8(err)
     }
 }
 
